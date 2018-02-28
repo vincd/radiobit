@@ -73,6 +73,7 @@ typedef struct _radio_state_t {
     uint8_t prefix0;        // for PREFIX0 register (lower 8 bits only)
     uint8_t data_rate;      // one of: RADIO_MODE_MODE_Nrf_{250Kbit,1Mbit,2Mbit}
     uint8_t pid;            // PID for ESB DPL
+    uint8_t previous_pid;
     uint8_t sniff_raw;      // raw sniffing
 } radio_state_t;
 
@@ -247,13 +248,17 @@ void RADIO_IRQHandler(void) {
                             esb_ready = 0;
 
                             /* Write packet size to rx_buf. */
-                            rx_buf[0] = 0xC0 | payload_length;
+                            // rx_buf[0] = 0xC0 | payload_length;
+                            rx_buf[0] = 0xC0 | (payload_length + 2);
 
                             /* Write address to rx_buf. */
                             memcpy(&rx_buf[1], payload, 5);
 
+                            rx_buf[6] = payload[5];        // LEN | PID
+                            rx_buf[7] = payload[6] & 0x80; // NO_ACK
+
                             for(x = 0; x < payload_length + 3; x++)
-                                rx_buf[6+x] = ((payload[6 + x] << 1) & 0xFF) | (payload[7 + x] >> 7);
+                                rx_buf[8+x] = ((payload[6 + x] << 1) & 0xFF) | (payload[7 + x] >> 7);
 
                             // only move the rx_buf pointer if there is enough room for another full packet
                             if (rx_buf + 2*radio_state.max_payload <= buf_end) {
@@ -266,27 +271,6 @@ void RADIO_IRQHandler(void) {
                         }
                     }
                 }
-            } else {
-                /* Raw mode, don't take the CRC into account. */
-
-                /* Kinda lock we use to avoid conflicts. */
-                esb_ready = 0;
-
-                /* Write packet size to rx_buf. */
-                payload_length = 0x28;
-                rx_buf[0] = 0xC0 | payload_length;
-
-                /* Write address to rx_buf. */
-                memcpy(&rx_buf[1], payload, 0x28);
-
-                // only move the rx_buf pointer if there is enough room for another full packet
-                if (rx_buf + 2*radio_state.max_payload <= buf_end) {
-                    rx_buf += radio_state.max_payload;
-                    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-                }
-
-                /* Data updated, ready to be read. */
-                esb_ready = 1;
             }
         } else if (radio_state.mode == MODE_ESB) {
             size_t len = rx_buf[0];
@@ -299,51 +283,8 @@ void RADIO_IRQHandler(void) {
                     NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
                 }
             }
-        } else if (radio_state.mode == MODE_SB) {
-            size_t len = radio_state.max_payload;
+        } 
 
-            // only move the rx_buf pointer if there is enough room for another full packet
-            if (rx_buf + 2*radio_state.max_payload <= buf_end) {
-                rx_buf += len;
-                NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-            }
-        } else if (radio_state.mode == MODE_CX) {
-            size_t len = radio_state.max_payload;
-
-            /* Unscramble packet. */
-            for (uint8_t i=0; i<len; i++) {
-                rx_buf[i] = bit_reverse(rx_buf[i]) ^ bit_reverse(xn297_scramble[i+5]);
-            }
-
-            // only move the rx_buf pointer if there is enough room for another full packet
-            if (rx_buf + 2*radio_state.max_payload <= buf_end) {
-                rx_buf += len;
-                NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-            }
-        } else if (radio_state.mode == MODE_BLE) {
-            size_t len = rx_buf[1];
-
-            // if the CRC was valid then accept the packet
-            if ((NRF_RADIO->CRCSTATUS == 1)) {
-
-                // shift rx buffer by 5 bytes
-                for (uint8_t i=40;i!=0;i--) {
-                    rx_buf[i+5] = rx_buf[i];
-                }
-                rx_buf[5] = rx_buf[0];
-
-                // add current channel and timestamp
-                timestamp = uBit.systemTime();
-                memcpy((void*)&rx_buf[1], &timestamp, 4);
-                rx_buf[0] = radio_state.channel;
-
-                // only move the rx_buf pointer if there is enough room for another full packet
-                if (rx_buf + len + 45 + 8 <= buf_end) {
-                    rx_buf += len + 8;
-                    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-                }
-            }
-        }
         NRF_RADIO->TASKS_START = 1;
     }
 }
@@ -530,6 +471,7 @@ static void radio_enable_esb(void) {
 
     // Sniff mode on
     radio_state.mode = MODE_ESB;
+    radio_state.previous_pid = 0xFF;
 
     // allocate tx and rx buffers
     size_t max_payload = 34; // an extra byte to store the length
@@ -581,8 +523,8 @@ static void radio_enable_esb(void) {
                        (0                                   << RADIO_PCNF1_STATLEN_Pos) |
                        (38        << RADIO_PCNF1_MAXLEN_Pos);
 
-   NRF_RADIO->TXADDRESS = 0; // transmit on logical address 0
-   NRF_RADIO->RXADDRESSES = 1; // a bit mask, listen only to logical address 0
+    NRF_RADIO->TXADDRESS = 0; // transmit on logical address 0
+    NRF_RADIO->RXADDRESSES = 1; // a bit mask, listen only to logical address 0
 
     NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Two;
     NRF_RADIO->CRCINIT = 0xFFFF;
@@ -608,100 +550,11 @@ static void radio_enable_esb(void) {
 }
 
 static void radio_enable_sb(void) {
-    radio_disable();
-
-    // Sniff mode on
-    radio_state.mode = MODE_SB;
-
-    // allocate tx and rx buffers
-    size_t max_payload = radio_state.max_payload; // an extra byte to store the length
-    size_t queue_len = radio_state.queue_len; // one extra for tx buffer
-    MP_STATE_PORT(radio_buf) = m_new(uint8_t, max_payload * queue_len);
-    buf_end = MP_STATE_PORT(radio_buf) + max_payload * queue_len;
-    rx_buf = MP_STATE_PORT(radio_buf) + max_payload; // start is tx buffer
-
-    // Enable the High Frequency clock on the processor. This is a pre-requisite for
-    // the RADIO module. Without this clock, no communication is possible.
-    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0);
-
-    // power should be one of: -30, -20, -16, -12, -8, -4, 0, 4
-    NRF_RADIO->TXPOWER = radio_state.power_dbm;
-
-    // should be between 0 and 100 inclusive (actual physical freq is 2400MHz + this register)
-    NRF_RADIO->FREQUENCY = radio_state.channel;
-
-    // configure default data rate
-    NRF_RADIO->MODE = radio_state.data_rate;
-
-    // The radio supports filtering packets at the hardware level based on an address.
-    // We use a 5-byte address comprised of 4 bytes (set by BALEN=4 below) from the BASEx
-    // register, plus 1 byte from PREFIXm.APn.
-    // The (x,m,n) values are selected by the logical address.  We use logical address 0
-    // which means using BASE0 with PREFIX0.AP0.
-    //
-    // ESB mode uses address as big endian, combined with group with a default address
-    // size of 5 bytes (mostly used on ESB compatible devices).
-    // ESB address is composed of address.group, for instance to address device
-    // 11:22:33:44:55 then use: address=0x11223344 and group=0x55.
-    NRF_RADIO->BASE0 = bytewise_bit_swap(
-        (radio_state.base0 & 0x000000ff)<<24 |
-        (radio_state.base0 & 0xff000000)>>24 |
-        (radio_state.base0 & 0x0000ff00)<< 8 |
-        (radio_state.base0 & 0x00ff0000)>> 8
-    );
-    NRF_RADIO->PREFIX0 = bytewise_bit_swap(radio_state.prefix0);
-
-    NRF_RADIO->PCNF0 = (0 << RADIO_PCNF0_S0LEN_Pos) | (0 << RADIO_PCNF0_LFLEN_Pos) | (0 << RADIO_PCNF0_S1LEN_Pos);
-    NRF_RADIO->PCNF1 = (RADIO_PCNF1_WHITEEN_Disabled        << RADIO_PCNF1_WHITEEN_Pos) |
-                       (RADIO_PCNF1_ENDIAN_Big              << RADIO_PCNF1_ENDIAN_Pos)  |
-                       ((4) << RADIO_PCNF1_BALEN_Pos)   |
-                       (radio_state.max_payload             << RADIO_PCNF1_STATLEN_Pos) |
-                       (radio_state.max_payload             << RADIO_PCNF1_MAXLEN_Pos);
-
-    //NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Two;
-    NRF_RADIO->CRCCNF = 0x0;
-    NRF_RADIO->CRCINIT = 0xFFFF;
-    NRF_RADIO->CRCPOLY = 0x11021;
-
-    NRF_RADIO->TXADDRESS = 0; // transmit on logical address 0
-    NRF_RADIO->RXADDRESSES = 1; // a bit mask, listen only to logical address 0
-
-    // set receive buffer
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-
-    // configure interrupts
-    NRF_RADIO->INTENSET = 0x00000008;
-    NVIC_ClearPendingIRQ(RADIO_IRQn);
-    NVIC_EnableIRQ(RADIO_IRQn);
-
-    NRF_RADIO->SHORTS = 0;
-
-    // enable receiver
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (NRF_RADIO->EVENTS_READY == 0);
-
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->TASKS_START = 1;
+    // REMOVE
 }
 
 static void radio_enable_cx(void) {
-    radio_disable();
-
-    /* Force payload size. */
-    radio_state.max_payload = 29;
-
-    /* Force address (XN297) */
-    radio_state.base0 = 0x2f7d8726;
-    radio_state.prefix0 = 0x49;
-
-    /* Enable SB */
-    radio_enable_sb();
-
-    /* Consider this mode as MODE_CX. */
-    radio_state.mode = MODE_CX;
+    // REMOVE
 }
 
 
@@ -713,85 +566,7 @@ static void radio_enable_cx(void) {
  */
 
 void radio_enable_ble(void) {
-    radio_disable();
-
-    // Sniff mode on
-    radio_state.mode = MODE_BLE;
-
-    // allocate tx and rx buffers
-    size_t max_payload = 45; // an extra byte to store the length + timestamp + channel
-    size_t queue_len = radio_state.queue_len; // one extra for tx buffer
-    MP_STATE_PORT(radio_buf) = m_new(uint8_t, max_payload * queue_len);
-    buf_end = MP_STATE_PORT(radio_buf) + max_payload * queue_len;
-    rx_buf = MP_STATE_PORT(radio_buf) + max_payload; // start is tx buffer
-
-    // Enable the High Frequency clock on the processor. This is a pre-requisite for
-    // the RADIO module. Without this clock, no communication is possible.
-    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0);
-
-    // power should be one of: -30, -20, -16, -12, -8, -4, 0, 4
-    NRF_RADIO->TXPOWER = radio_state.power_dbm;
-
-    // should be between 0 and 100 inclusive (actual physical freq is 2400MHz + this register)
-    NRF_RADIO->FREQUENCY = channel_resolver_get_frequency(radio_state.channel);
-    NRF_RADIO->DATAWHITEIV = radio_state.channel;
-
-    // configure default data rate
-    NRF_RADIO->MODE = RADIO_MODE_MODE_Ble_1Mbit;
-    radio_state.data_rate = RADIO_MODE_MODE_Ble_1Mbit;
-
-    /* Set default access address used on advertisement channels. */
-    NRF_RADIO->PREFIX0 = 0x8e;
-    radio_state.prefix0 = 0x8e;
-    NRF_RADIO->BASE0 = 0x89bed600;
-    radio_state.base0 = 0x89bed600;
-    NRF_RADIO->TXADDRESS = 0; // transmit on logical address 0
-    NRF_RADIO->RXADDRESSES = 1; // a bit mask, listen only to logical address 0
-
-    NRF_RADIO->PCNF0 = (
-      (((1UL) << RADIO_PCNF0_S0LEN_Pos) & RADIO_PCNF0_S0LEN_Msk) |  /* Length of S0 field in bytes 0-1.    */
-      (((2UL) << RADIO_PCNF0_S1LEN_Pos) & RADIO_PCNF0_S1LEN_Msk) |  /* Length of S1 field in bits 0-8.     */
-      (((6UL) << RADIO_PCNF0_LFLEN_Pos) & RADIO_PCNF0_LFLEN_Msk)    /* Length of length field in bits 0-8. */
-    );
-
-    /* Packet configuration */
-    NRF_RADIO->PCNF1 = (
-      (((37UL) << RADIO_PCNF1_MAXLEN_Pos) & RADIO_PCNF1_MAXLEN_Msk)   |                      /* Maximum length of payload in bytes [0-255] */
-      (((0UL) << RADIO_PCNF1_STATLEN_Pos) & RADIO_PCNF1_STATLEN_Msk)   |                      /* Expand the payload with N bytes in addition to LENGTH [0-255] */
-      (((3UL) << RADIO_PCNF1_BALEN_Pos) & RADIO_PCNF1_BALEN_Msk)       |                      /* Base address length in number of bytes. */
-      (((RADIO_PCNF1_ENDIAN_Little) << RADIO_PCNF1_ENDIAN_Pos) & RADIO_PCNF1_ENDIAN_Msk) |  /* Endianess of the S0, LENGTH, S1 and PAYLOAD fields. */
-      (((1UL) << RADIO_PCNF1_WHITEEN_Pos) & RADIO_PCNF1_WHITEEN_Msk)                         /* Enable packet whitening */
-    );
-
-    /* CRC config */
-    NRF_RADIO->CRCCNF  = (RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos) |
-                         (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos); /* Skip Address when computing CRC */
-    NRF_RADIO->CRCINIT = 0x555555;                                                  /* Initial value of CRC */
-    NRF_RADIO->CRCPOLY = 0x00065B;                                                  /* CRC polynomial function */
-
-    NRF_RADIO->TIFS = 145;
-
-    // set receive buffer
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-
-    // configure interrupts
-    NRF_RADIO->INTENSET = 0x00000008;
-    NVIC_ClearPendingIRQ(RADIO_IRQn);
-    NVIC_EnableIRQ(RADIO_IRQn);
-
-    /* Clear events */
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->SHORTS = 0;
-
-    // enable receiver
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (NRF_RADIO->EVENTS_READY == 0);
-
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->TASKS_START = 1;
+    // REMOVE
 }
 
 /**
@@ -804,87 +579,7 @@ void radio_enable_ble(void) {
  */
 
 void radio_enable_ble_ll(void) {
-    radio_disable();
-
-    // Sniff mode on
-    radio_state.mode = MODE_BLE_LL;
-
-    // allocate tx and rx buffers
-    size_t max_payload = 45; // an extra byte to store the length + timestamp + channel
-    size_t queue_len = radio_state.queue_len + 1; // one extra for tx buffer
-    MP_STATE_PORT(radio_buf) = m_new(uint8_t, max_payload * queue_len);
-    buf_end = MP_STATE_PORT(radio_buf) + max_payload * queue_len;
-    rx_buf = MP_STATE_PORT(radio_buf) + max_payload; // start is tx buffer
-
-    // Enable the High Frequency clock on the processor. This is a pre-requisite for
-    // the RADIO module. Without this clock, no communication is possible.
-    NRF_CLOCK->EVENTS_HFCLKSTARTED = 0;
-    NRF_CLOCK->TASKS_HFCLKSTART = 1;
-    while (NRF_CLOCK->EVENTS_HFCLKSTARTED == 0);
-
-    // power should be one of: -30, -20, -16, -12, -8, -4, 0, 4
-    NRF_RADIO->TXPOWER = radio_state.power_dbm;
-
-    // should be between 0 and 100 inclusive (actual physical freq is 2400MHz + this register)
-    NRF_RADIO->FREQUENCY = channel_resolver_get_frequency(radio_state.channel);
-    NRF_RADIO->DATAWHITEIV = radio_state.channel;
-
-    // configure default data rate
-    NRF_RADIO->MODE = RADIO_MODE_MODE_Ble_1Mbit;
-    radio_state.data_rate = RADIO_MODE_MODE_Ble_1Mbit;
-
-    /* Set access address, onnly the _address_ parameter is used for simplicity. */
-    NRF_RADIO->PREFIX0 = (radio_state.base0 & 0xff000000)>>24;
-    NRF_RADIO->BASE0 = (radio_state.base0 & 0x00ffffff);
-    NRF_RADIO->TXADDRESS = 0; // transmit on logical address 0
-    NRF_RADIO->RXADDRESSES = 1; // a bit mask, listen only to logical address 0
-
-    /* No extra fields, address is directly followed by our data. */
-    NRF_RADIO->PCNF0 = (
-      (((0UL) << RADIO_PCNF0_S0LEN_Pos) & RADIO_PCNF0_S0LEN_Msk) |  /* Length of S0 field in bytes 0-1.    */
-      (((0UL) << RADIO_PCNF0_S1LEN_Pos) & RADIO_PCNF0_S1LEN_Msk) |  /* Length of S1 field in bits 0-8.     */
-      (((0UL) << RADIO_PCNF0_LFLEN_Pos) & RADIO_PCNF0_LFLEN_Msk)    /* Length of length field in bits 0-8. */
-    );
-
-    /* Packet configuration */
-    NRF_RADIO->PCNF1 = (
-      (((37UL) << RADIO_PCNF1_MAXLEN_Pos) & RADIO_PCNF1_MAXLEN_Msk)   |                      /* Maximum length of payload in bytes [0-255] */
-      (((0UL) << RADIO_PCNF1_STATLEN_Pos) & RADIO_PCNF1_STATLEN_Msk)   |                      /* Expand the payload with N bytes in addition to LENGTH [0-255] */
-      (((3UL) << RADIO_PCNF1_BALEN_Pos) & RADIO_PCNF1_BALEN_Msk)       |                      /* Base address length in number of bytes. */
-      (((RADIO_PCNF1_ENDIAN_Little) << RADIO_PCNF1_ENDIAN_Pos) & RADIO_PCNF1_ENDIAN_Msk) |  /* Endianess of the S0, LENGTH, S1 and PAYLOAD fields. */
-      (((1UL) << RADIO_PCNF1_WHITEEN_Pos) & RADIO_PCNF1_WHITEEN_Msk)                         /* Enable packet whitening */
-    );
-
-    /* CRC disabled. */
-    NRF_RADIO->CRCCNF = 0x0;
-    /*
-    NRF_RADIO->CRCCNF  = (RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos) |
-                         (RADIO_CRCCNF_SKIPADDR_Skip << RADIO_CRCCNF_SKIPADDR_Pos);
-    */
-    NRF_RADIO->CRCINIT = 0x555555;                                                  /* Initial value of CRC */
-    NRF_RADIO->CRCPOLY = 0x00065B;                                                  /* CRC polynomial function */
-
-    NRF_RADIO->TIFS = 145;
-
-    // set receive buffer
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-
-    // configure interrupts
-    NRF_RADIO->INTENSET = 0x00000008;
-    NVIC_ClearPendingIRQ(RADIO_IRQn);
-    NVIC_EnableIRQ(RADIO_IRQn);
-
-    /* Clear events */
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->SHORTS = 0;
-
-    // enable receiver
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (NRF_RADIO->EVENTS_READY == 0);
-
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->TASKS_START = 1;
+    // REMOVE
 }
 
 
@@ -896,79 +591,19 @@ void radio_send(const void *buf, size_t len, const void *buf2, size_t len2) {
     if (radio_state.mode == MODE_SNIFF)
         return;
 
-    if (radio_state.mode == MODE_DEFAULT)
-    {
-        // construct the packet
-        // note: we must send from RAM
-        size_t max_len = NRF_RADIO->PCNF1 & 0xff;
-        if (len + len2 > max_len) {
-            if (len > max_len) {
-                len = max_len;
-                len2 = 0;
-            } else {
-                len2 = max_len - len;
-            }
-        }
-
-        MP_STATE_PORT(radio_buf)[0] = len + len2;
-        memcpy(MP_STATE_PORT(radio_buf) + 1, buf, len);
-        if (len2 != 0) {
-            memcpy(MP_STATE_PORT(radio_buf) + 1 + len, buf2, len2);
-        }
-    } else if (radio_state.mode == MODE_ESB)
+    if (radio_state.mode == MODE_ESB)
     {
         if (len > 254)
             len = 254;
 
         /* Write header (size + PID/ACK). */
         MP_STATE_PORT(radio_buf)[0] = len;
-        MP_STATE_PORT(radio_buf)[1] = (radio_state.pid<<1)|1; /* NO ACK required. */
+        MP_STATE_PORT(radio_buf)[1] = (radio_state.pid<<1)|0; /* NO ACK required. */
         radio_state.pid = (radio_state.pid + 1)%4; /* Increment PID. */
 
         /* Copy payload into memory. */
         memcpy(MP_STATE_PORT(radio_buf)+2, buf, len);
-    } else if (radio_state.mode == MODE_SB)
-    {
-        /* Copy payload into memory, no header. */
-        memcpy(MP_STATE_PORT(radio_buf), buf, radio_state.max_payload);
-    } else if (radio_state.mode == MODE_CX) {
-        /* Write XN297 preamble. */
-        MP_STATE_PORT(radio_buf)[0] = 0x71;
-        MP_STATE_PORT(radio_buf)[1] = 0x0F;
-        MP_STATE_PORT(radio_buf)[2] = 0x55;
-
-        /* Write target address (always 0x2f, 0x7d, 0x87, 0x26, 0x49) */
-        MP_STATE_PORT(radio_buf)[3] = 0x2f;
-        MP_STATE_PORT(radio_buf)[4] = 0x7d;
-        MP_STATE_PORT(radio_buf)[5] = 0x87;
-        MP_STATE_PORT(radio_buf)[6] = 0x26;
-        MP_STATE_PORT(radio_buf)[7] = 0x49;
-
-        /* Perform scrambling. */
-        for (uint8_t i=0; i<len;i++) {
-            MP_STATE_PORT(radio_buf)[i+8] = bit_reverse(((uint8_t *)buf)[i]) ^ xn297_scramble[i+5];
-        }
-
-        /* And add the CRC. */
-        uint16_t crc = initial;
-        for (uint8_t i = 0; i < (len+5); ++i) {
-            crc = crc16_update(crc, MP_STATE_PORT(radio_buf)[i+3]);
-        }
-        crc ^= xn297_crc_xorout[5 - 3 + len];
-        MP_STATE_PORT(radio_buf)[8 + len] = crc>>8;
-        MP_STATE_PORT(radio_buf)[8 + len + 1 ] = crc & 0xff;
-    } else if (radio_state.mode == MODE_BLE) {
-        /* Reset rx_buffer (test) */
-        //rx_buf = MP_STATE_PORT(radio_buf) + 45;
-
-        /* Write header (PDU type, TxAdd, RxAdd) + length + S1 (0x00). */
-        MP_STATE_PORT(radio_buf)[0] = ((unsigned char *)buf)[0];
-        MP_STATE_PORT(radio_buf)[1] = len-1;
-        MP_STATE_PORT(radio_buf)[2] = 0;
-
-        /* Copy payload into memory. */
-        memcpy(MP_STATE_PORT(radio_buf)+3, (void *)((unsigned char*)buf + 1), len-1);
-    }
+    } 
 
     // transmission will occur synchronously
     NVIC_DisableIRQ(RADIO_IRQn);
@@ -1011,185 +646,7 @@ void radio_send(const void *buf, size_t len, const void *buf2, size_t len2) {
     NVIC_EnableIRQ(RADIO_IRQn);
 }
 
-/**
- * radio_ping()
- *
- * Sends a packet to the TX address and wait for an ACK.
- **/
-int radio_ping() {
-    int ack_received = 0;
-
-    ensure_enabled();
-
-    /* Only available in ESB mode. */
-    if (radio_state.mode != MODE_ESB)
-        return false;
-
-    /* Build an ESB DPL packet. */
-    MP_STATE_PORT(radio_buf)[0] = 4;
-
-    /* If len2 != 0, then requires an ack packet (used for ping). */
-    MP_STATE_PORT(radio_buf)[1] = (radio_state.pid<<1); /* ACK required */
-
-    /* Copy payload to RAM. */
-    memcpy(MP_STATE_PORT(radio_buf)+2, ping_pkt, 4);
-
-    /* Increment PID. */
-    radio_state.pid = (radio_state.pid + 1)%4;
-
-    // transmission will occur synchronously
-    NVIC_DisableIRQ(RADIO_IRQn);
-
-    /* Configure shorts. */
-    NRF_RADIO->SHORTS   = 0;
-
-    // Turn off the transceiver.
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0);
-
-    // Turn on the transmitter, and wait for it to signal that it's ready to use.
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_TXEN = 1;
-    while (NRF_RADIO->EVENTS_READY == 0);
-
-    // Start transmission and wait for end of packet.
-    NRF_RADIO->TASKS_START = 1;
-    NRF_RADIO->EVENTS_END = 0;
-    while (NRF_RADIO->EVENTS_END == 0);
-
-    // Return the radio to using the default receive buffer
-    NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-
-    // Turn off the transmitter.
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0);
-
-    // Start listening for the next packet (expecting an ACK)
-    NRF_RADIO->EVENTS_READY = 0;
-    NRF_RADIO->TASKS_RXEN = 1;
-    while (NRF_RADIO->EVENTS_READY == 0);
-
-    NRF_RADIO->EVENTS_END = 0;
-    NRF_RADIO->TASKS_START = 1;
-
-    /* Wait a bit for an ACK ... (only once) */
-    nrf_delay_us(250);
-
-    /* Check if we got a valid packet. */
-    if(NRF_RADIO->EVENTS_END && NRF_RADIO->CRCSTATUS != 0)
-    {
-        /* Ack received \o/ ! */
-        ack_received = 1;
-    }
-
-    /* Cleaning and resuming IRQ handler. */
-    NRF_RADIO->SHORTS = 0;
-    NRF_RADIO->INTENSET = 0x00000008;
-
-    NVIC_ClearPendingIRQ(RADIO_IRQn);
-    NVIC_EnableIRQ(RADIO_IRQn);
-
-    return ack_received;
-}
-
-
-/**
- * radio_ping()
- *
- * Finds the channel the current address is listening on.
- **/
-int radio_find() {
-    int ack_received = 0;
-
-    ensure_enabled();
-
-    /* Only available in ESB mode. */
-    if (radio_state.mode != MODE_ESB)
-        return false;
-
-    // transmission will occur synchronously
-    NVIC_DisableIRQ(RADIO_IRQn);
-
-    /* Configure shorts. */
-    NRF_RADIO->SHORTS   = 0;
-
-    // Turn off the transceiver.
-    NRF_RADIO->EVENTS_DISABLED = 0;
-    NRF_RADIO->TASKS_DISABLE = 1;
-    while (NRF_RADIO->EVENTS_DISABLED == 0);
-
-    for (int channel=1; channel <= 100; channel++)
-    {
-        /* Build an ESB DPL packet. */
-        MP_STATE_PORT(radio_buf)[0] = 4;
-
-        /* If len2 != 0, then requires an ack packet (used for ping). */
-        MP_STATE_PORT(radio_buf)[1] = (radio_state.pid<<1); /* ACK required */
-
-        /* Copy payload to RAM. */
-        memcpy(MP_STATE_PORT(radio_buf)+2, ping_pkt, 4);
-
-        /* Increment PID. */
-        radio_state.pid = (radio_state.pid + 1)%4;
-
-        /* Tune to the correct channel. */
-        radio_state.channel = channel;
-        NRF_RADIO->FREQUENCY = radio_state.channel;
-
-        // Turn on the transmitter, and wait for it to signal that it's ready to use.
-        NRF_RADIO->EVENTS_READY = 0;
-        NRF_RADIO->TASKS_TXEN = 1;
-        while (NRF_RADIO->EVENTS_READY == 0);
-
-        // Start transmission and wait for end of packet.
-        NRF_RADIO->TASKS_START = 1;
-        NRF_RADIO->EVENTS_END = 0;
-        while (NRF_RADIO->EVENTS_END == 0);
-
-        // Return the radio to using the default receive buffer
-        NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
-
-        // Turn off the transmitter.
-        NRF_RADIO->EVENTS_DISABLED = 0;
-        NRF_RADIO->TASKS_DISABLE = 1;
-        while (NRF_RADIO->EVENTS_DISABLED == 0);
-
-        // Start listening for the next packet (expecting an ACK)
-        NRF_RADIO->EVENTS_READY = 0;
-        NRF_RADIO->TASKS_RXEN = 1;
-        while (NRF_RADIO->EVENTS_READY == 0);
-
-        NRF_RADIO->EVENTS_END = 0;
-        NRF_RADIO->TASKS_START = 1;
-
-        /* Wait a bit for an ACK ... (only once) */
-        nrf_delay_us(250);
-
-        /* Check if we got a valid packet. */
-        if(NRF_RADIO->EVENTS_END && NRF_RADIO->CRCSTATUS != 0)
-        {
-            /* Ack received \o/ ! */
-            ack_received = 1;
-            break;
-        }
-    }
-
-    /* Cleaning and resuming IRQ handler. */
-    NRF_RADIO->SHORTS = 0;
-    NRF_RADIO->INTENSET = 0x00000008;
-
-    NVIC_ClearPendingIRQ(RADIO_IRQn);
-    NVIC_EnableIRQ(RADIO_IRQn);
-
-    /* Send result. */
-    if (ack_received == 1)
-        return radio_state.channel;
-    else
-        return -1;
-}
-
+// REMOVE
 
 static mp_obj_t radio_receive(bool typed_packet) {
     uint8_t *buf = NULL;
@@ -1202,34 +659,6 @@ static mp_obj_t radio_receive(bool typed_packet) {
     NVIC_DisableIRQ(RADIO_IRQn);
 
     switch(radio_state.mode) {
-        case MODE_DEFAULT:
-            {
-                // get the pointer to the next packet
-                buf = MP_STATE_PORT(radio_buf) + (NRF_RADIO->PCNF1 & 0xff) + 1; // skip tx buf
-
-                // return None if there are no packets waiting
-                if (rx_buf == buf) {
-                    NVIC_EnableIRQ(RADIO_IRQn);
-                    return mp_const_none;
-                }
-
-                // Get packet len and create the Python object
-                len = buf[0];
-                if (!typed_packet) {
-                    ret = mp_obj_new_bytes(buf + 1, len); // if it raises the radio irq remains disabled...
-                } else if (len >= 3 && buf[1] == 1 && buf[2] == 0 && buf[3] == 1) {
-                    ret = mp_obj_new_str((char*)buf + 4, len - 3, false); // if it raises the radio irq remains disabled...
-                } else {
-                    NVIC_EnableIRQ(RADIO_IRQn);
-                    nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "received packet is not a string"));
-                }
-
-                // copy the rest of the packets down and restart the radio
-                memmove(buf, buf + 1 + len, rx_buf - (buf + 1 + len));
-                rx_buf -= 1 + len;
-            }
-            break;
-
         case MODE_ESB:
             {
                 buf = MP_STATE_PORT(radio_buf) + 34; // skip tx buf
@@ -1242,63 +671,17 @@ static mp_obj_t radio_receive(bool typed_packet) {
 
                 // Get packet len and PID
                 len = buf[0];
+                uint8_t pid = buf[1] >> 1;
 
-                /* Don't care about acks for now :) */
-                ret = mp_obj_new_bytes((const unsigned char *)buf+2, len);
+                // if (pid != radio_state.previous_pid) {
+                    /* Don't care about acks for now :) */
+                    ret = mp_obj_new_bytes((const unsigned char *)buf, len+2);
+                    // radio_state.previous_pid = pid;
 
-                // copy the rest of the packets down and restart the radio
-                memmove(buf, buf + 2 + len, rx_buf - (buf + 2 + len));
-                rx_buf -= (2 + len);
-            }
-            break;
-
-        case MODE_CX:
-        case MODE_SB:
-            {
-                buf = MP_STATE_PORT(radio_buf) + radio_state.max_payload; // skip tx buf
-
-                // return None if there are no packets waiting
-                if (rx_buf == buf) {
-                    NVIC_EnableIRQ(RADIO_IRQn);
-                    return mp_const_none;
-                }
-
-                // Get packet len and PID
-                len = radio_state.max_payload;
-
-                /* Don't care about acks for now :) */
-                ret = mp_obj_new_bytes((const unsigned char *)buf, len);
-
-                // copy the rest of the packets down and restart the radio
-                memmove(buf, buf + len, rx_buf - (buf + len));
-                rx_buf -= (len);
-            }
-            break;
-
-        case MODE_BLE:
-            {
-                buf = MP_STATE_PORT(radio_buf) + 45; // skip tx buf
-
-                // return None if there are no packets waiting
-                if (rx_buf == buf) {
-                    NVIC_EnableIRQ(RADIO_IRQn);
-                    return mp_const_none;
-                }
-
-                // Get packet len (2 + packet size + 5 bytes header)
-                len = buf[6] + 8;
-
-                ret = mp_obj_new_bytes((const unsigned char *)buf, len);
-
-                // copy the rest of the packets down and restart the radio
-                memmove(buf, buf + len, rx_buf - (buf + len));
-                rx_buf -= len;
-            }
-            break;
-
-
-        case MODE_SNIFF:
-            {
+                    // copy the rest of the packets down and restart the radio
+                    memmove(buf, buf + 2 + len, rx_buf - (buf + 2 + len));
+                    rx_buf -= (2 + len);                    
+                //}
             }
             break;
     }
@@ -1339,6 +722,7 @@ static mp_obj_t radio_sniff(void) {
     }
 
 
+    /*
     size_t len = buf[0]&0x3F;
     if (len > 32)
         len = 32;
@@ -1348,6 +732,14 @@ static mp_obj_t radio_sniff(void) {
     // copy the rest of the packets down and restart the radio
     memmove(buf, buf + radio_state.max_payload, rx_buf - (buf + radio_state.max_payload));
     rx_buf -= radio_state.max_payload;
+    */
+
+    size_t len = rx_buf - buf;
+    mp_obj_t ret;
+    ret = mp_obj_new_bytes(&buf[0], len);
+    // copy the rest of the packets down and restart the radio
+    rx_buf = buf;
+
     NRF_RADIO->PACKETPTR = (uint32_t)rx_buf;
     NRF_RADIO->EVENTS_END = 0;
     NRF_RADIO->TASKS_START = 1;
@@ -1580,19 +972,14 @@ STATIC mp_obj_t mod_radio_send_bytes(mp_obj_t buf_in) {
 MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_send_bytes_obj, mod_radio_send_bytes);
 
 STATIC mp_obj_t mod_radio_ping(void) {
-    if (radio_ping())
-        return mp_const_true;
+    // REMOVE
     return mp_const_false;
 }
 MP_DEFINE_CONST_FUN_OBJ_0(mod_radio_ping_obj, mod_radio_ping);
 
 STATIC mp_obj_t mod_radio_find(void) {
-    int result;
-    result = radio_find();
-    if (result < 0)
-        return mp_const_false;
-    else
-        return mp_const_true;
+    // REMOVE
+    return mp_const_false;
 }
 MP_DEFINE_CONST_FUN_OBJ_0(mod_radio_find_obj, mod_radio_find);
 
@@ -1635,6 +1022,196 @@ STATIC mp_obj_t mod_radio_sniff(void) {
 MP_DEFINE_CONST_FUN_OBJ_0(mod_radio_sniff_obj, mod_radio_sniff);
 
 
+
+
+
+void esb_send_bytes_cksum(char* buffer, uint8_t buffer_size) {
+    char payload[32];
+    uint8_t payload_size = buffer_size + 1;
+
+    for(int i=0; i < buffer_size; i++) {
+        payload[i] = buffer[i];
+    }
+
+    uint8_t cksum = 0xff;
+
+    for (int n = 0; n < buffer_size; n++) {
+        cksum = (cksum - payload[n]) & 0xff;
+    }
+    cksum = (cksum + 1) & 0xff;
+    payload[buffer_size] = cksum;
+
+    radio_send(payload, payload_size, NULL, 0);
+
+
+    // uint8_t retry_count = 4;
+    int ack_received = 0;
+
+    // while(retry_count-- && ack_received == 0) {
+    /* Wait a bit for an ACK ... */
+    nrf_delay_us(250);
+
+    /* Check if we got a valid packet. */
+    if(NRF_RADIO->EVENTS_END && NRF_RADIO->CRCSTATUS != 0)
+    {
+        /* Ack received \o/ ! */
+        ack_received = 1;
+    }
+
+    /* Cleaning and resuming IRQ handler. */
+    NRF_RADIO->SHORTS = 0;
+    NRF_RADIO->INTENSET = 0x00000008;
+
+    NVIC_ClearPendingIRQ(RADIO_IRQn);
+    NVIC_EnableIRQ(RADIO_IRQn);
+
+    // }
+}
+
+
+// STATIC mp_obj_t mod_radio_esb_send_keys(mp_obj_t buf_in) {
+//     char payload[32];
+//     uint8_t payload_size = 10;
+    
+//     mp_uint_t len;
+//     const char *data = mp_obj_str_get_data(buf_in, &len);
+
+
+//     for(int i=0; i < payload_size; i++) {
+//         payload[i] = 0;
+//     }
+
+//     payload[0] = 0x00;
+//     payload[1] = 0xC1; // opcode
+//     payload[2] = 0x00; // meta
+
+
+//     for(int i=0; i < len; i++) {
+//         payload[3+i] = data[i];
+//     }
+
+//     uint8_t cksum = 0xff;
+//     int last = payload_size - 1;  
+
+//     for (int n = 0; n < last; n++) {
+//         cksum = (cksum - payload[n]) & 0xff;
+//     }
+//     cksum = (cksum + 1) & 0xff;
+//     payload[last] = cksum;
+
+//     printf("%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8], payload[9]);
+//     radio_send(payload, payload_size, NULL, 0);
+
+
+//     return mp_const_none;
+// }
+// MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_esb_send_keys_obj, mod_radio_esb_send_keys);
+
+STATIC mp_obj_t mod_radio_esb_send_keys(mp_obj_t buf_in) {
+    char payload[32];
+    uint8_t payload_size = 10;
+    
+    mp_uint_t len;
+    const char *data = mp_obj_str_get_data(buf_in, &len);
+
+
+    for(int i=0; i < payload_size; i++) {
+        payload[i] = 0;
+    }
+
+    payload[0] = 0x00;
+    payload[1] = 0xC1; // opcode
+
+    for(int i=0; i < len; i++) {
+        payload[2+i] = data[i];
+    }
+
+    esb_send_bytes_cksum(payload, 9);
+
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_esb_send_keys_obj, mod_radio_esb_send_keys);
+
+
+STATIC mp_obj_t mod_radio_esb_send_bytes(mp_obj_t buf_in) {
+    mp_uint_t len;
+    const char *data = mp_obj_str_get_data(buf_in, &len);
+
+    // esb_send_bytes_cksum(data, len):
+
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_esb_send_bytes_obj, mod_radio_esb_send_bytes);
+
+
+
+// STATIC mp_obj_t mod_radio_esb_send_full_keep_alive(void) {
+//     // 00 4f 00 00 55 00 00 00 00
+//     char *keep_alive_set_00_55 = "\x00\x4f\x00\x00\x55\x00\x00\x00\x00";
+//     char *keep_alive_set_03_70 = "\x00\x4f\x00\x03\x70\x00\x00\x00\x00";
+//     char *keep_alive_00_55 = "\x00\x40\x00\x55";
+//     char *keep_alive_03_70 = "\x00\x40\x03\x70";
+
+//     esb_send_bytes_cksum(keep_alive_set_00_55, 9);
+
+//     for (int i=0; i< 12; i++) {
+//         esb_send_bytes_cksum(keep_alive_00_55, 4);
+//         nrf_delay_ms(65);
+//     }
+
+
+//     esb_send_bytes_cksum(keep_alive_set_03_70, 9);
+
+//     return mp_const_none;
+// }
+// MP_DEFINE_CONST_FUN_OBJ_0(mod_radio_esb_send_keep_alive_obj, mod_radio_esb_send_keep_alive);
+
+
+STATIC mp_obj_t mod_radio_esb_send_set_keep_alive(mp_obj_t buf_in) {
+    char payload[32];
+    uint8_t payload_size = 10;
+    
+    mp_uint_t len;
+    const char *data = mp_obj_str_get_data(buf_in, &len);
+
+    payload[0] = 0x00;
+    payload[1] = 0x4f; // opcode
+    payload[2] = 0x00;
+    payload[3] = data[0];
+    payload[4] = data[1];
+    payload[5] = 0x00;
+    payload[6] = 0x00;
+    payload[7] = 0x00;
+    payload[8] = 0x00;
+    payload[9] = 0x00;
+
+    esb_send_bytes_cksum(payload, 9);
+
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_esb_send_set_keep_alive_obj, mod_radio_esb_send_set_keep_alive);
+
+STATIC mp_obj_t mod_radio_esb_send_keep_alive(mp_obj_t buf_in) {
+    char payload[32];
+    uint8_t payload_size = 10;
+    
+    mp_uint_t len;
+    const char *data = mp_obj_str_get_data(buf_in, &len);
+
+    payload[0] = 0x00;
+    payload[1] = 0x40; // opcode
+    payload[2] = data[0];
+    payload[3] = data[1];
+    payload[4] = 0x00;
+
+    esb_send_bytes_cksum(payload, 4);
+
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_1(mod_radio_esb_send_keep_alive_obj, mod_radio_esb_send_keep_alive);
+
+
+
 STATIC const mp_map_elem_t radio_module_globals_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR_radio) },
     { MP_OBJ_NEW_QSTR(MP_QSTR___init__), (mp_obj_t)&mod_radio_reset_obj },
@@ -1651,6 +1228,13 @@ STATIC const mp_map_elem_t radio_module_globals_table[] = {
     /* ESB Sniffing. */
     { MP_OBJ_NEW_QSTR(MP_QSTR_sniff_on), (mp_obj_t)&mod_radio_sniff_on_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_sniff), (mp_obj_t)&mod_radio_sniff_obj },
+
+    /* ESB functions */
+    { MP_OBJ_NEW_QSTR(MP_QSTR_esb_send_keys), (mp_obj_t)&mod_radio_esb_send_keys_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_esb_send_bytes), (mp_obj_t)&mod_radio_esb_send_bytes_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_esb_send_set_keep_alive), (mp_obj_t)&mod_radio_esb_send_set_keep_alive_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_esb_send_keep_alive), (mp_obj_t)&mod_radio_esb_send_keep_alive_obj },
+    // { MP_OBJ_NEW_QSTR(MP_QSTR_esb_send_keep_alive2), (mp_obj_t)&mod_radio_esb_send_keep_alive2_obj },
 
     /* ultra-light ESB mode. */
     { MP_OBJ_NEW_QSTR(MP_QSTR_esb), (mp_obj_t)&mod_radio_esb_obj },
